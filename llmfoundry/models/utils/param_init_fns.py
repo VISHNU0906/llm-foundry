@@ -443,6 +443,8 @@ def multihead_attention_init(
 def te_layernorm_mlp_init(
     module: nn.Module,
     init_fn_: Callable,
+    init_div_is_residual: Union[int, float, str, bool],
+    div_is_residual: float,
     **kwargs: Any,
 ) -> bool:
     del kwargs  # unused, just to capture any extra args
@@ -462,8 +464,9 @@ def te_layernorm_mlp_init(
             assert isinstance(module.fc2_bias, torch.Tensor)
             torch.nn.init.zeros_(module.fc2_bias)
 
-        with torch.no_grad():
-            module.fc2_weight.div_(div_is_residual)  # type: ignore
+        if init_div_is_residual is not False:
+            with torch.no_grad():
+                module.fc2_weight.div_(div_is_residual)  # type: ignore
 
         return True
 

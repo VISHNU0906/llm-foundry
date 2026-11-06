@@ -4,7 +4,9 @@ import math
 from collections import OrderedDict
 from collections.abc import Sequence
 from functools import partial
+from types import SimpleNamespace
 from typing import Optional, Union
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -26,6 +28,7 @@ from llmfoundry.models.utils.param_init_fns import (
     fused_param_init_helper,
     multihead_attention_init,
     stacked_param_init_helper,
+    te_layernorm_mlp_init,
 )
 
 
@@ -675,3 +678,113 @@ def test_multihead_attention_init_dtensor_vs_tensor(
 
         assert torch.equal(dtensor_out_proj_weight, expected_out_proj_weight), \
             f'DTensor out_proj.weight was not scaled correctly: {dtensor_out_proj_weight} vs {expected_out_proj_weight}'
+
+
+class _FakeTELayerNormMLP(nn.Module):
+    """Stand-in for transformer_engine.pytorch.LayerNormMLP for unit tests."""
+
+    def __init__(
+        self,
+        d_model: int = 8,
+        ffn_hidden_size: int = 16,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.layer_norm_weight = nn.Parameter(torch.empty(d_model))
+        self.layer_norm_bias = nn.Parameter(torch.empty(d_model))
+        self.fc1_weight = nn.Parameter(torch.empty(ffn_hidden_size, d_model))
+        self.fc1_bias = nn.Parameter(
+            torch.empty(ffn_hidden_size),
+        ) if bias else None
+        self.fc2_weight = nn.Parameter(torch.empty(d_model, ffn_hidden_size))
+        self.fc2_bias = nn.Parameter(torch.empty(d_model)) if bias else None
+
+
+@pytest.mark.parametrize('init_div_is_residual', [True, False, 3.0])
+def test_te_layernorm_mlp_init_div_is_residual(
+    init_div_is_residual: Union[bool, float],
+):
+    """Regression for #1901: te_layernorm_mlp_init must accept div args.
+
+    Previously ``del kwargs`` dropped ``div_is_residual`` and the later
+    ``fc2_weight.div_(div_is_residual)`` raised NameError. Residual scaling
+    should follow the megablocks FFN pattern (scale fc2 when enabled).
+    """
+    d_model, ffn_hidden = 8, 16
+    div_is_residual = 2.0
+    module = _FakeTELayerNormMLP(d_model=d_model, ffn_hidden_size=ffn_hidden)
+    fake_te = SimpleNamespace(LayerNormMLP=_FakeTELayerNormMLP)
+
+    with patch(
+        'llmfoundry.models.utils.param_init_fns.te',
+        fake_te,
+    ):
+        did_init = te_layernorm_mlp_init(
+            module,
+            nn.init.ones_,
+            init_div_is_residual=init_div_is_residual,
+            div_is_residual=div_is_residual,
+        )
+
+    assert did_init is True
+    assert torch.equal(module.layer_norm_weight, torch.ones(d_model))
+    assert torch.equal(module.layer_norm_bias, torch.zeros(d_model))
+    assert torch.equal(
+        module.fc1_weight,
+        torch.ones(ffn_hidden, d_model),
+    )
+    assert module.fc1_bias is not None
+    assert torch.equal(module.fc1_bias, torch.zeros(ffn_hidden))
+    assert module.fc2_bias is not None
+    assert torch.equal(module.fc2_bias, torch.zeros(d_model))
+
+    if init_div_is_residual is False:
+        expected_fc2 = torch.ones(d_model, ffn_hidden)
+    else:
+        expected_fc2 = torch.ones(d_model, ffn_hidden) / div_is_residual
+    assert torch.equal(module.fc2_weight, expected_fc2)
+
+
+def test_te_layernorm_mlp_init_via_generic_param_init_fn():
+    """Exercise the registered path that used to NameError on te_ln_mlp."""
+    d_model, n_layers = 8, 2
+    module = _FakeTELayerNormMLP(d_model=d_model, ffn_hidden_size=16)
+    fake_te = SimpleNamespace(LayerNormMLP=_FakeTELayerNormMLP)
+
+    with patch(
+        'llmfoundry.models.utils.param_init_fns.te',
+        fake_te,
+    ):
+        generic_param_init_fn_(
+            module,
+            init_fn_=nn.init.ones_,
+            n_layers=n_layers,
+            d_model=d_model,
+            init_div_is_residual=True,
+        )
+
+    expected = 1.0 / math.sqrt(2 * n_layers)
+    assert torch.allclose(
+        module.fc2_weight,
+        torch.full_like(module.fc2_weight, expected),
+    )
+    assert torch.equal(module.fc1_weight, torch.ones_like(module.fc1_weight))
+    assert torch.equal(
+        module.layer_norm_weight,
+        torch.ones_like(module.layer_norm_weight),
+    )
+
+
+def test_te_layernorm_mlp_init_ignores_non_te_module():
+    fake_te = SimpleNamespace(LayerNormMLP=_FakeTELayerNormMLP)
+    linear = nn.Linear(4, 4)
+    with patch(
+        'llmfoundry.models.utils.param_init_fns.te',
+        fake_te,
+    ):
+        assert te_layernorm_mlp_init(
+            linear,
+            nn.init.ones_,
+            init_div_is_residual=True,
+            div_is_residual=2.0,
+        ) is False
